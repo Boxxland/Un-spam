@@ -1,212 +1,129 @@
-const { Client, GatewayIntentBits, PermissionFlagsBits, EmbedBuilder, Partials } = require("discord.js");
+const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 
-// ---- CONFIG ----
-const config = {
-  exemptChannels: ["ใส่channel_id_ที่ยกเว้น"],
-  logChannel: "ใส่log_channel_id",
-  adminRole: "ใส่admin_role_id",
+// โหลดไฟล์ config
+const config = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
 
-  // Anti-Spam
-  rateLimit: { messages: 100, seconds: 60 },
-  duplicateLimit: 10,
-
-  // Anti-Raid
-  minAccountAge: 7,           // บัญชีอายุน้อยกว่า 7 วัน = ต้องสงสัย
-  raidThreshold: 5,           // เข้า server เกิน 5 คนใน 10 วินาที = raid
-  raidTimeWindow: 10000,      // 10 วินาที
-  newMemberAction: "kick",    // kick หรือ ban
-};
-
-// ---- Discord Client ----
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-  ],
-  partials: [Partials.Channel, Partials.Message],
+    GatewayIntentBits.GuildMembers
+  ]
 });
 
-// ---- Trackers ----
-const spamTracker = new Map();
-const joinTracker = [];  // เก็บ timestamp การเข้า server
-let isLocked = false;
-let isRaidMode = false;
+// โหลดคำสั่งจากโฟลเดอร์ commands
+client.commands = new Map();
+const commandsPath = path.join(__dirname, 'commands');
+const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
+for (const file of commandFiles) {
+  const command = require(path.join(commandsPath, file));
+  client.commands.set(command.data.name, command);
+}
 
-// ---- Helpers ----
-async function sendLog(guild, embed) {
+// ไฟล์ JSON ใช้เก็บข้อมูล spam/raid และ whitelist
+const stateFilePath = './state.json';
+let state = JSON.parse(fs.readFileSync(stateFilePath, 'utf8'));
+
+// บันทึก state ลงไฟล์
+function saveState() {
+  fs.writeFileSync(stateFilePath, JSON.stringify(state, null, 2));
+}
+
+// Log ระบบ
+const logChannelId = config.logChannelId;
+
+// Event: เมื่อ Bot Online
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}!`);
+});
+
+// Event: เมื่อมีข้อความใหม่
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  const { content, author, guild } = message;
+
+  // ตรวจสอบ Whitelisted Role
+  const memberRoles = message.member.roles.cache;
+  if (memberRoles.some(role => config.whitelistedRoles.includes(role.id))) return;
+
   try {
-    const logCh = await guild.channels.fetch(config.logChannel);
-    if (logCh) await logCh.send({ content: config.adminRole ? `<@&${config.adminRole}>` : "", embeds: [embed] });
-  } catch {}
-}
+    // คำสั่ง Lock/Unlock (แยกไฟล์ในโฟลเดอร์ commands)
+    if (content.startsWith(config.prefix)) {
+      const args = content.slice(config.prefix.length).trim().split(/\s+/);
+      const command = args.shift().toLowerCase();
 
-async function lockAll(guild, reason) {
-  if (isLocked) return;
-  isLocked = true;
-  let count = 0;
-  for (const [, channel] of guild.channels.cache) {
-    if (!channel.isTextBased()) continue;
-    if (config.exemptChannels.includes(channel.id)) continue;
-    try {
-      await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false, AddReactions: false });
-      count++;
-    } catch {}
-  }
-  await sendLog(guild, new EmbedBuilder()
-    .setColor("#ff0000")
-    .setTitle("🔒 SERVER LOCKED!")
-    .setDescription(`**สาเหตุ:** ${reason}\n**ช่องที่ล็อก:** ${count} ช่อง\nใช้ \`!unlock\` เพื่อปลดล็อก`)
-    .setTimestamp()
-  );
-}
-
-async function unlockAll(guild) {
-  let count = 0;
-  for (const [, channel] of guild.channels.cache) {
-    if (!channel.isTextBased()) continue;
-    if (config.exemptChannels.includes(channel.id)) continue;
-    try {
-      await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null, AddReactions: null });
-      count++;
-    } catch {}
-  }
-  isLocked = false;
-  isRaidMode = false;
-  return count;
-}
-
-// ---- Ready ----
-client.once("ready", () => {
-  console.log(`✅ Anti-Spam + Anti-Raid Bot ออนไลน์! ${client.user.tag}`);
-});
-
-// ---- Anti-Raid: ตรวจจับการเข้า server ----
-client.on("guildMemberAdd", async (member) => {
-  const now = Date.now();
-
-  // เช็คอายุบัญชี
-  const accountAge = (now - member.user.createdTimestamp) / (1000 * 60 * 60 * 24);
-  const isSuspicious = accountAge < config.minAccountAge;
-
-  // บันทึกการเข้า
-  joinTracker.push({ time: now, memberId: member.id, suspicious: isSuspicious });
-
-  // ลบ entry เก่าออก
-  const recentJoins = joinTracker.filter(j => now - j.time < config.raidTimeWindow);
-  joinTracker.length = 0;
-  joinTracker.push(...recentJoins);
-
-  const suspiciousJoins = recentJoins.filter(j => j.suspicious).length;
-
-  // ถ้าเข้าเยอะเกินไปใน window = Raid!
-  if (recentJoins.length >= config.raidThreshold && !isRaidMode) {
-    isRaidMode = true;
-    await lockAll(member.guild, `🚨 ตรวจพบ RAID! มีคน ${recentJoins.length} คนเข้า server ใน ${config.raidTimeWindow / 1000} วินาที`);
-  }
-
-  // ถ้าบัญชีน้อยกว่า X วัน และ raid mode เปิดอยู่
-  if (isSuspicious && isRaidMode) {
-    try {
-      if (config.newMemberAction === "ban") {
-        await member.ban({ reason: `Anti-Raid: บัญชีอายุน้อยกว่า ${config.minAccountAge} วัน` });
-      } else {
-        await member.kick(`Anti-Raid: บัญชีอายุน้อยกว่า ${config.minAccountAge} วัน`);
+      if (client.commands.has(command)) {
+        await client.commands.get(command).execute(message, args, state);
+        saveState(); // บันทึก state หลังคำสั่ง
       }
-      await sendLog(member.guild, new EmbedBuilder()
-        .setColor("#ff6600")
-        .setTitle(`🚨 ${config.newMemberAction === "ban" ? "แบน" : "Kick"} สมาชิกต้องสงสัย`)
-        .addFields(
-          { name: "👤 ชื่อ", value: member.user.tag, inline: true },
-          { name: "📅 อายุบัญชี", value: `${Math.floor(accountAge)} วัน`, inline: true },
-          { name: "🆔 ID", value: member.id, inline: true },
-        )
-        .setTimestamp()
-      );
-    } catch {}
-    return;
-  }
+    }
 
-  // แจ้งเตือนถ้าบัญชีใหม่น่าสงสัยแม้ไม่ raid mode
-  if (isSuspicious) {
-    await sendLog(member.guild, new EmbedBuilder()
-      .setColor("#ffcc00")
-      .setTitle("⚠️ สมาชิกใหม่บัญชีอายุน้อย")
-      .addFields(
-        { name: "👤 ชื่อ", value: member.user.tag, inline: true },
-        { name: "📅 อายุบัญชี", value: `${Math.floor(accountAge)} วัน`, inline: true },
-        { name: "🆔 ID", value: member.id, inline: true },
-      )
-      .setTimestamp()
-    );
-  }
-});
+    // ตรวจจับ Spam หรือข้อความซ้ำ
+    if (!state.spamUsers[author.id]) {
+      state.spamUsers[author.id] = { lastMessage: '', repeatCount: 0, timeout: false };
+    }
 
-// ---- Anti-Spam: ตรวจจับข้อความ ----
-client.on("messageCreate", async (message) => {
-  if (message.author.bot || !message.guild) return;
+    const userState = state.spamUsers[author.id];
+    if (userState.timeout) return;
 
-  const isAdmin = message.member?.roles.cache.has(config.adminRole) ||
-                  message.member?.permissions.has(PermissionFlagsBits.Administrator);
-
-  // ---- Admin Commands ----
-  if (message.content === "!unlock" && isAdmin) {
-    const count = await unlockAll(message.guild);
-    return message.reply(`✅ ปลดล็อก ${count} ช่องแล้วครับ! Raid mode ปิดแล้ว`);
-  }
-
-  if (message.content === "!raidmode" && isAdmin) {
-    if (isRaidMode) {
-      isRaidMode = false;
-      return message.reply("✅ ปิด Raid Mode แล้วครับ");
+    if (userState.lastMessage === content) {
+      userState.repeatCount++;
     } else {
-      isRaidMode = true;
-      return message.reply("🚨 เปิด Raid Mode แล้วครับ บัญชีใหม่จะถูก kick อัตโนมัติ");
+      userState.lastMessage = content;
+      userState.repeatCount = 0;
     }
-  }
 
-  if (message.content === "!status" && isAdmin) {
-    return message.reply({ embeds: [new EmbedBuilder()
-      .setColor(isLocked ? "#ff0000" : "#00cc66")
-      .setTitle("📊 สถานะระบบ")
-      .addFields(
-        { name: "🔒 Server Lock", value: isLocked ? "🔴 ล็อกอยู่" : "🟢 ปกติ", inline: true },
-        { name: "🚨 Raid Mode", value: isRaidMode ? "🔴 เปิดอยู่" : "🟢 ปิด", inline: true },
-      )
-      .setTimestamp()
-    ]});
-  }
-
-  // ---- Spam Detection ----
-  const userId = message.author.id;
-  const now = Date.now();
-
-  if (!spamTracker.has(userId)) {
-    spamTracker.set(userId, { messages: [], lastContent: "", duplicateCount: 0 });
-  }
-
-  const tracker = spamTracker.get(userId);
-  tracker.messages = tracker.messages.filter(t => now - t < config.rateLimit.seconds * 1000);
-  tracker.messages.push(now);
-
-  if (message.content === tracker.lastContent) {
-    tracker.duplicateCount++;
-  } else {
-    tracker.duplicateCount = 1;
-    tracker.lastContent = message.content;
-  }
-
-  const isRateSpam = tracker.messages.length >= config.rateLimit.messages;
-  const isDupSpam = tracker.duplicateCount >= config.duplicateLimit;
-
-  if ((isRateSpam || isDupSpam) && !isAdmin) {
-    const reason = isRateSpam && isDupSpam ? "ส่งเร็วเกิน + ซ้ำ" : isRateSpam ? "ส่งข้อความเร็วเกินไป" : "ข้อความซ้ำ";
-    spamTracker.delete(userId);
-    if (!isLocked) {
-      await lockAll(message.guild, `🚨 Spam จาก ${message.author.tag}: ${reason}`);
+    if (userState.repeatCount >= config.spamThreshold) {
+      await message.member.timeout(60 * 1000, 'Spamming messages');
+      userState.timeout = true;
+      client.channels.cache.get(logChannelId)?.send(`User ${author.tag} was timed out for spamming.`);
+      saveState();
     }
+
+  } catch (error) {
+    console.error('Error handling message:', error);
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// Event: สมาชิกใหม่เข้ามา
+client.on('guildMemberAdd', async (member) => {
+  const guildStats = state.guilds[member.guild.id] || { memberJoinTimes: [] };
+  const joinTime = Date.now();
+  guildStats.memberJoinTimes.push(joinTime);
+  state.guilds[member.guild.id] = guildStats;
+
+  // ลบข้อมูลเก่ากว่า 1 นาที
+  guildStats.memberJoinTimes = guildStats.memberJoinTimes.filter(time => joinTime - time < 60000);
+
+  if (guildStats.memberJoinTimes.length >= config.raidThreshold) {
+    state.raidMode = true; // เปิด Raid mode
+    client.channels.cache.get(logChannelId)?.send(`Raid detection triggered. Raid mode enabled!`);
+    saveState();
+  }
+
+  saveState();
+});
+
+// พิมพ์คำสั่ง Error ให้เห็น
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const command = client.commands.get(interaction.commandName);
+
+  if (!command) return;
+
+  try {
+    await command.execute(interaction, state);
+    saveState();
+  } catch (error) {
+    console.error(error);
+    await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true });
+  }
+});
+
+// Login to Discord
+client.login(config.token);
